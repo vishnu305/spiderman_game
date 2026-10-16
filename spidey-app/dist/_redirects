@@ -1,0 +1,2 @@
+# Netlify: proxy Google News RSS through our own domain (fixes browser CORS). Free.
+/gnews/*  https://news.google.com/:splat  200

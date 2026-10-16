@@ -1,0 +1,48 @@
+name: spidey_flutter
+description: "Spidey 3D - a talking 3D Spider-Man assistant. Native Flutter shell around the React/Three.js web app."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_inappwebview: ^6.1.5
+  speech_to_text: ^7.0.0
+  flutter_tts: ^4.2.0
+  permission_handler: ^11.3.1
+  http: ^1.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.1
+
+flutter:
+  uses-material-design: true
+
+  # The built React app (copied here by copy_web.ps1) is served from these
+  # folders by the in-app localhost server. Flutter does NOT include
+  # sub-folders automatically: every folder that contains files must be listed.
+  assets:
+    - assets/web/
+    - assets/web/assets/
+    - assets/web/icons/
+    - assets/web/img/
+    - assets/web/models/
+
+flutter_launcher_icons:
+  image_path: "assets/web/icons/icon-1024.png"
+  android: true
+  ios: true
+  remove_alpha_ios: true
+  adaptive_icon_background: "#120a1e"
+  adaptive_icon_foreground: "assets/web/icons/icon-1024.png"
+  windows:
+    generate: true
+    image_path: "assets/web/icons/icon-1024.png"
+    icon_size: 256

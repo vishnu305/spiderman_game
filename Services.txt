@@ -1,0 +1,266 @@
+import 'dart:math';
+import 'news_service.dart';
+
+/// Tiny in-memory BM25 retriever (the "R" of RAG). Nothing is stored on disk.
+class Bm25 {
+  static const _stop = {'a','an','the','and','or','of','to','in','on','for','with','is','are','was','were','be','by','at','from','as','that','this','it','about','what','who','when','where','why','how','tell','me','news','latest','today'};
+  List<NewsItem> _items = [];
+  List<Map<String, int>> _tf = [];
+  List<int> _len = [];
+  final Map<String, int> _df = {};
+  double _avg = 1;
+
+  List<String> _tok(String s) => RegExp(r'[a-z0-9]+').allMatches(s.toLowerCase()).map((m) => m.group(0)!).where((w) => !_stop.contains(w)).toList();
+
+  void build(List<NewsItem> items) {
+    _items = items; _tf = []; _len = []; _df.clear();
+    for (final it in items) {
+      final t = _tok('${it.title} ${it.title} ${it.desc} ${it.source}');
+      final tf = <String, int>{};
+      for (final w in t) { tf[w] = (tf[w] ?? 0) + 1; }
+      _tf.add(tf); _len.add(t.length);
+      for (final w in tf.keys) { _df[w] = (_df[w] ?? 0) + 1; }
+    }
+    _avg = _len.isEmpty ? 1 : _len.reduce((a, b) => a + b) / _len.length;
+  }
+
+  List<NewsItem> search(String q, {int k = 5}) {
+    const k1 = 1.5, b = 0.75; final n = _items.length; final qs = _tok(q);
+    final scored = <MapEntry<NewsItem, double>>[];
+    for (var i = 0; i < n; i++) {
+      var s = 0.0;
+      for (final w in qs) {
+        final f = _tf[i][w] ?? 0; if (f == 0) continue;
+        final df = _df[w]!; final idf = log(1 + (n - df + 0.5) / (df + 0.5));
+        s += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * _len[i] / _avg));
+      }
+      if (s > 0) scored.add(MapEntry(_items[i], s));
+    }
+    scored.sort((a, b) => b.value.compareTo(a.value));
+    return scored.take(k).map((e) => e.key).toList();
+  }
+}
+
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'news_service.dart';
+
+const persona =
+    'You are Spidey, the friendly neighborhood Spider-Man, anchoring a retro TV show called "Spidey News 24". Warm, upbeat, a little witty, always accurate and neutral. Never invent facts: use only the provided stories.';
+
+class GroqService {
+  String key, model, worker;
+  GroqService({this.key = '', this.model = 'llama-3.3-70b-versatile', this.worker = ''});
+  bool get enabled => key.isNotEmpty || worker.isNotEmpty;
+  String get _base => worker.isNotEmpty ? '${worker.replaceAll(RegExp(r"/$"), "")}/groq' : 'https://api.groq.com/openai/v1';
+
+  Future<String> chat(List<Map<String, String>> messages, {bool json = false, double temperature = 0.5, int maxTokens = 700}) async {
+    for (final m in [model, 'llama-3.1-8b-instant']) {          // fallback model
+      final body = {'model': m, 'messages': messages, 'temperature': temperature, 'max_tokens': maxTokens, if (json) 'response_format': {'type': 'json_object'}};
+      final r = await http.post(Uri.parse('$_base/chat/completions'),
+          headers: {'Content-Type': 'application/json', if (key.isNotEmpty) 'Authorization': 'Bearer $key'}, body: jsonEncode(body));
+      if (r.statusCode == 200) return (jsonDecode(r.body)['choices'][0]['message']['content'] as String).trim();
+      if (m == 'llama-3.1-8b-instant') throw Exception('Groq ${r.statusCode}: ${r.body.substring(0, r.body.length.clamp(0, 160))}');
+    }
+    throw Exception('Groq failed');
+  }
+
+  /// Turns raw headlines into an anchor script: {"intro":..., "stories":[...], "outro":...}
+  Future<Map<String, dynamic>> bulletin(List<NewsItem> items) async {
+    final list = [for (var i = 0; i < items.length; i++) '${i + 1}. ${items[i].title} — ${items[i].desc} (source: ${items[i].source})'].join('\n');
+    final txt = await chat([
+      {'role': 'system', 'content': persona},
+      {'role': 'user', 'content': '$list\n\nWrite a spoken bulletin as JSON: {"intro":"1 short greeting","stories":["1-2 spoken sentences per story, same order"],"outro":"short sign-off with the words stay webbed"}'}
+    ], json: true);
+    return jsonDecode(txt) as Map<String, dynamic>;
+  }
+
+  /// RAG answer: question + retrieved headlines -> grounded spoken answer.
+  Future<String> answer(String q, List<NewsItem> hits) {
+    final ctx = [for (var i = 0; i < hits.length; i++) '[${i + 1}] ${hits[i].title} — ${hits[i].desc} (${hits[i].source})'].join('\n');
+    return chat([
+      {'role': 'system', 'content': '$persona Answer ONLY from the CONTEXT. If it is not there, say you do not have it yet. Max 60 words, spoken style, name the source.'},
+      {'role': 'user', 'content': 'CONTEXT:\n$ctx\n\nQUESTION: $q'}
+    ], temperature: 0.2, maxTokens: 250);
+  }
+}
+
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+
+class NewsItem {
+  final String title, desc, source, url;
+  final DateTime time;
+  NewsItem(this.title, this.desc, this.source, this.url, this.time);
+  factory NewsItem.fromJson(Map<String, dynamic> j) => NewsItem(j['title'] ?? '', j['desc'] ?? j['title'] ?? '', j['source'] ?? '', j['url'] ?? '#',
+      DateTime.fromMillisecondsSinceEpoch((j['time'] ?? DateTime.now().millisecondsSinceEpoch) as int));
+}
+
+/// Calls the Cloudflare Worker (/news) which merges RSS feeds + GDELT. If no worker URL, falls back to Hacker News (free, no key).
+class NewsService {
+  static Future<List<NewsItem>> fetch(String topic, String worker) async {
+    if (worker.isNotEmpty) {
+      final r = await http.get(Uri.parse('${worker.replaceAll(RegExp(r"/$"), "")}/news?topic=$topic'));
+      if (r.statusCode != 200) throw Exception('News worker error ${r.statusCode}');
+      final items = (jsonDecode(r.body)['items'] as List).map((e) => NewsItem.fromJson(e)).toList();
+      return items;
+    }
+    final ids = jsonDecode((await http.get(Uri.parse('https://hacker-news.firebaseio.com/v0/topstories.json'))).body) as List;
+    final out = <NewsItem>[];
+    for (final id in ids.take(12)) {
+      final s = jsonDecode((await http.get(Uri.parse('https://hacker-news.firebaseio.com/v0/item/$id.json'))).body);
+      if (s != null) out.add(NewsItem(s['title'] ?? '', s['title'] ?? '', 'Hacker News', s['url'] ?? '#', DateTime.fromMillisecondsSinceEpoch(((s['time'] ?? 0) as int) * 1000)));
+    }
+    return out;
+  }
+}
+import 'dart:async';
+import 'dart:math';
+import 'package:flutter/material.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:speech_to_text/speech_to_text.dart';
+import 'services/news_service.dart';
+import 'services/groq_service.dart';
+import 'services/bm25.dart';
+
+void main() => runApp(const SpideyNewsApp());
+
+class SpideyNewsApp extends StatelessWidget {
+  const SpideyNewsApp({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(debugShowCheckedModeBanner: false, title: 'Spidey News 24', theme: ThemeData.dark(useMaterial3: true), home: const NewsDesk());
+}
+
+class NewsDesk extends StatefulWidget {
+  const NewsDesk({super.key});
+  @override
+  State<NewsDesk> createState() => _NewsDeskState();
+}
+
+class _NewsDeskState extends State<NewsDesk> with TickerProviderStateMixin {
+  final groq = GroqService(); final bm25 = Bm25(); final tts = FlutterTts(); final stt = SpeechToText();
+  late final AnimationController idle = AnimationController(vsync: this, duration: const Duration(seconds: 4))..repeat();
+  List<NewsItem> items = []; String topic = 'world'; String pose = 'e'; bool onAir = false, listening = false, talking = false; String? lowerTitle, lowerSrc; String status = 'Ready';
+  int run = 0; Timer? refreshTimer; Offset tilt = Offset.zero; int page = 0;
+  static const topics = ['world', 'india', 'tech', 'business', 'sports', 'science'];
+
+  @override
+  void initState() {
+    super.initState();
+    tts.setSpeechRate(0.48); tts.setPitch(0.95); tts.awaitSpeakCompletion(true);
+    tts.setStartHandler(() => setState(() => talking = true)); tts.setCompletionHandler(() => setState(() => talking = false));
+    refresh(); refreshTimer = Timer.periodic(const Duration(seconds: 60), (_) => refresh());   // live news every minute
+  }
+  @override
+  void dispose() { refreshTimer?.cancel(); idle.dispose(); super.dispose(); }
+
+  Future<void> refresh() async {
+    try { final l = await NewsService.fetch(topic, groq.worker); l.sort((a, b) => b.time.compareTo(a.time)); setState(() => items = l.take(40).toList()); bm25.build(items); }
+    catch (e) { toast('$e'); }
+  }
+  void toast(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  Future<void> talk(String t) async { await tts.speak(t); }
+
+  Future<void> goOnAir() async {
+    if (onAir) { run++; await tts.stop(); setState(() { onAir = false; lowerTitle = null; status = 'Ready'; }); return; }
+    final id = ++run; bool alive() => run == id; setState(() { onAir = true; status = 'On air'; });
+    if (items.isEmpty) await refresh(); final list = items.take(6).toList(); if (list.isEmpty) return;
+    Map<String, dynamic> bul;
+    try { bul = groq.enabled ? await groq.bulletin(list) : _template(list); } catch (e) { toast('AI script failed: $e'); bul = _template(list); }
+    setState(() => pose = 'g'); await talk(bul['intro']); if (!alive()) return;
+    final poses = ['e', 'g', 'e', 'd', 'e', 'a'];
+    for (var i = 0; i < list.length; i++) {
+      if (!alive()) return; setState(() { pose = poses[(i + 1) % poses.length]; page = i ~/ 3; lowerTitle = list[i].title; lowerSrc = list[i].source; });
+      await talk((bul['stories'] as List)[i].toString());
+    }
+    if (!alive()) return; setState(() { pose = 'g'; lowerTitle = null; }); await talk(bul['outro']); setState(() { onAir = false; status = 'Ready'; });
+  }
+  Map<String, dynamic> _template(List<NewsItem> l) => {'intro': 'Good day! This is Spidey News 24.', 'stories': [for (final s in l) '${s.title}. Source: ${s.source}.'], 'outro': 'That is all for now. Stay webbed, stay informed!'};
+
+  Future<void> ask() async {
+    if (listening) { await stt.stop(); setState(() => listening = false); return; }
+    final ok = await stt.initialize(); if (!ok) return toast('Microphone / speech recognition not available');
+    run++; await tts.stop(); setState(() { listening = true; onAir = false; status = 'Listening…'; });
+    await stt.listen(onResult: (r) async {
+      if (!r.finalResult) return; setState(() { listening = false; status = 'Thinking…'; });
+      final q = r.recognizedWords; final hits = bm25.search(q);
+      String a; try { a = hits.isEmpty ? "I don't see that in the latest headlines." : groq.enabled ? await groq.answer(q, hits) : '${hits.first.title}. Source: ${hits.first.source}.'; } catch (e) { a = 'My web signal is weak.'; toast('$e'); }
+      setState(() { lowerTitle = a; lowerSrc = 'ANSWER'; pose = 'g'; status = 'Answering'; }); await talk(a); setState(() => status = 'Ready');
+    });
+  }
+
+  void settings() {
+    final k = TextEditingController(text: groq.key), w = TextEditingController(text: groq.worker), m = TextEditingController(text: groq.model);
+    showDialog(context: context, builder: (_) => AlertDialog(title: const Text('Setup (kept in memory only)'), content: Column(mainAxisSize: MainAxisSize.min, children: [
+      TextField(controller: k, obscureText: true, decoration: const InputDecoration(labelText: 'Groq API key')), TextField(controller: m, decoration: const InputDecoration(labelText: 'Groq model')),
+      TextField(controller: w, decoration: const InputDecoration(labelText: 'News Worker URL (optional)'))]),
+      actions: [TextButton(onPressed: () { groq.key = k.text.trim(); groq.model = m.text.trim().isEmpty ? groq.model : m.text.trim(); groq.worker = w.text.trim(); Navigator.pop(context); refresh(); }, child: const Text('DONE'))]));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final size = MediaQuery.of(context).size;
+    return Scaffold(backgroundColor: const Color(0xFF120805), body: GestureDetector(
+      onPanUpdate: (d) => setState(() => tilt = Offset((tilt.dx + d.delta.dx / 400).clamp(-.35, .35), (tilt.dy + d.delta.dy / 400).clamp(-.2, .2))),
+      child: Stack(children: [
+        Positioned.fill(child: CustomPaint(painter: StudioPainter())),                                          // retro wall, desk, TVs
+        Positioned.fill(child: AnimatedBuilder(animation: idle, builder: (_, __) {
+          final t = idle.value * 2 * pi; final bob = sin(t * 2) * 4 + (talking ? (sin(t * 12).abs() * 8) : 0);
+          return Align(alignment: const Alignment(0, -0.15), child: Transform(alignment: Alignment.center,   // 2.5D tilt = fake 3D depth
+              transform: Matrix4.identity()..setEntry(3, 2, 0.0012)..rotateY(tilt.dx + sin(t) * .03)..rotateX(-tilt.dy)..translate(0.0, bob),
+              child: Image.asset('assets/poses/$pose.webp', height: size.height * .78, fit: BoxFit.contain, gaplessPlayback: true)));
+        })),
+        Positioned(left: size.width * .5 - 130, bottom: size.height * .14, child: NewspaperCard(items: items, page: page)),    // newspaper prop
+        Positioned(top: 40, left: 0, right: 0, child: Center(child: Wrap(spacing: 6, children: [for (final t in topics) ChoiceChip(label: Text(t.toUpperCase()), selected: topic == t, onSelected: (_) { setState(() => topic = t); refresh(); })]))),
+        Positioned(left: 12, top: size.height * .35, child: Column(children: [_tile(onAir ? 'STOP' : 'ON AIR', Icons.sensors, Colors.red, goOnAir), const SizedBox(height: 22), _tile(listening ? 'SEND' : 'ASK', Icons.mic, Colors.blue, ask)])),
+        Positioned(right: 12, top: size.height * .35, child: Column(children: [_tile('REFRESH', Icons.refresh, Colors.amber, refresh), const SizedBox(height: 22), _tile('SETUP', Icons.settings, Colors.blueGrey, settings)])),
+        if (lowerTitle != null) Positioned(left: 90, right: 90, bottom: 80, child: Container(padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: const Color(0xFF14243F), border: Border.all(color: Colors.white, width: 3)),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(lowerTitle!, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)), Text(lowerSrc ?? '', style: const TextStyle(fontSize: 12, color: Colors.white70))]))),
+        Positioned(left: 0, right: 0, bottom: 0, child: Container(height: 40, color: const Color(0xFF0B1428), alignment: Alignment.centerLeft, child: _Ticker(text: items.isEmpty ? 'Fetching latest headlines…' : items.map((e) => e.title).join('   ★   ')))),
+        Positioned(top: 8, left: 12, child: Chip(label: Text(onAir ? 'ON AIR' : 'LIVE'), backgroundColor: onAir ? Colors.red : Colors.brown)),
+        Positioned(bottom: 48, left: 0, right: 0, child: Center(child: Text('$status · AI: ${groq.enabled ? "GROQ" : "LOCAL"}', style: const TextStyle(fontSize: 12)))),
+      ])));
+  }
+  Widget _tile(String l, IconData i, Color c, VoidCallback f) => GestureDetector(onTap: f, child: Column(children: [Container(width: 62, height: 62, decoration: BoxDecoration(color: c, borderRadius: BorderRadius.circular(20), border: Border.all(color: Colors.white, width: 3), boxShadow: const [BoxShadow(color: Colors.black54, offset: Offset(0, 5))]), child: Icon(i, color: Colors.white, size: 34)), Text(l, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold))]));
+}
+
+/// Retro newsroom background drawn with a CustomPainter (wall, wood panels, globe, desk).
+class StudioPainter extends CustomPainter {
+  @override
+  void paint(Canvas c, Size s) {
+    c.drawRect(Offset.zero & s, Paint()..color = const Color(0xFF0D3340));
+    final wood = Paint()..color = const Color(0xFF5A3216);
+    c.drawRect(Rect.fromLTWH(0, s.height * .48, s.width, s.height * .3), wood);
+    for (var x = 0.0; x < s.width; x += 26) { c.drawLine(Offset(x, s.height * .48), Offset(x, s.height * .78), Paint()..color = Colors.black26..strokeWidth = 2); }
+    c.drawCircle(Offset(s.width / 2, s.height * .32), s.height * .22, Paint()..shader = const RadialGradient(colors: [Color(0xFF2FB0C8), Color(0x00115F78)]).createShader(Rect.fromCircle(center: Offset(s.width / 2, s.height * .32), radius: s.height * .22)));
+    c.drawRect(Rect.fromLTWH(0, s.height * .78, s.width, s.height * .22), Paint()..color = const Color(0xFF6B3A18));        // desk
+    c.drawRect(Rect.fromLTWH(0, s.height * .78, s.width, 6), Paint()..color = const Color(0xFFC89A4A));
+    final tp = TextPainter(text: const TextSpan(text: 'SPIDEY NEWS 24', style: TextStyle(fontSize: 34, color: Color(0xFFFF2A5E), fontWeight: FontWeight.w900, shadows: [Shadow(color: Color(0xFFFF2A5E), blurRadius: 20)])), textDirection: TextDirection.ltr)..layout();
+    tp.paint(c, Offset((s.width - tp.width) / 2, s.height * .08));
+  }
+  @override
+  bool shouldRepaint(_) => false;
+}
+
+class NewspaperCard extends StatelessWidget {
+  final List<NewsItem> items; final int page;
+  const NewspaperCard({super.key, required this.items, required this.page});
+  @override
+  Widget build(BuildContext context) {
+    final a = items.length > page * 3 ? items[page * 3] : null;
+    return Transform.rotate(angle: -.03, child: Container(width: 260, padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: const Color(0xFFEFE4C4), boxShadow: const [BoxShadow(color: Colors.black54, blurRadius: 12)]),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+          const Center(child: Text('THE DAILY WEB', style: TextStyle(color: Colors.black, fontSize: 22, fontWeight: FontWeight.w900, fontFamily: 'serif'))), const Divider(color: Colors.black, thickness: 2),
+          Text((a?.title ?? 'No news yet').toUpperCase(), maxLines: 3, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.black, fontSize: 15, fontWeight: FontWeight.w900, fontFamily: 'serif')),
+          Text(a?.desc ?? '', maxLines: 3, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.black87, fontSize: 11, fontFamily: 'serif'))])));
+  }
+}
+
+class _Ticker extends StatefulWidget { final String text; const _Ticker({required this.text}); @override State<_Ticker> createState() => _TickerState(); }
+class _TickerState extends State<_Ticker> with SingleTickerProviderStateMixin {
+  late final AnimationController c = AnimationController(vsync: this, duration: const Duration(seconds: 90))..repeat();
+  @override void dispose() { c.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(builder: (_, k) => AnimatedBuilder(animation: c, builder: (_, __) => Transform.translate(offset: Offset(k.maxWidth - c.value * (k.maxWidth + widget.text.length * 14.0), 0),
+      child: OverflowBox(maxWidth: double.infinity, alignment: Alignment.centerLeft, child: Text(widget.text, maxLines: 1, softWrap: false, style: const TextStyle(fontSize: 18, color: Color(0xFFFFE9A8)))))));
+}

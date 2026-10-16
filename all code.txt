@@ -1,0 +1,662 @@
+{"name":"Spidey News 24","short_name":"Spidey News","start_url":"./index.html","scope":"./","display":"standalone","orientation":"any","background_color":"#1b0d08","theme_color":"#1b0d08",
+ "icons":[{"src":"icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},{"src":"icon-512.png","sizes":"512x512","type":"image/png","purpose":"any"},{"src":"icon-maskable-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}]}
+// Caches only the app shell + images. News, voice and keys are never cached.
+const CACHE='spidey-news-v1';
+self.addEventListener('install',e=>{self.skipWaiting()});
+self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()))});
+self.addEventListener('fetch',e=>{const u=new URL(e.request.url);if(e.request.method!=='GET'||u.origin!==location.origin)return;
+ e.respondWith(fetch(e.request).then(r=>{const c=r.clone();caches.open(CACHE).then(k=>k.put(e.request,c));return r}).catch(()=>caches.match(e.request).then(m=>m||caches.match('./index.html'))))});
+import React from 'react';
+import { listVoices } from '../lib/speech.js';
+const B = import.meta.env.BASE_URL;
+
+export function Intro({ kind }) {            // kind: 'in' | 'out'
+  if (!kind) return null;
+  return kind === 'in' ? (
+    <div className="stinger in" style={{ backgroundImage: `url(${B}poses/f-bg.jpg)` }}>
+      <img className="swing" src={`${B}poses/c.webp`} alt="" />
+      <div className="stTitle">SPIDEY<br />NEWS 24</div><div className="stSub">YOUR FRIENDLY NEIGHBORHOOD NEWSCAST</div>
+    </div>
+  ) : (
+    <div className="stinger out" style={{ backgroundImage: `url(${B}poses/f-bg.jpg)` }}>
+      <img className="drop" src={`${B}poses/b.webp`} alt="" />
+      <div className="stTitle small">THAT'S THE NEWS!</div><div className="stSub">STAY WEBBED · STAY INFORMED</div>
+    </div>
+  );
+}
+export function LowerThird({ data }) {
+  if (!data) return null;
+  return (
+    <div className={'lower' + (data.breaking ? ' brk' : '')}>
+      <div className="tag">{data.breaking ? 'BREAKING' : data.tag || 'NEWS'}</div>
+      <div className="head">{data.title}</div>
+      <div className="meta">{data.source}{data.time ? ' · ' + new Date(data.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</div>
+    </div>
+  );
+}
+export function Ticker({ items }) {
+  const text = items.length ? items.map((i) => i.title).join('   ★   ') : 'Fetching the latest headlines…';
+  return <div className="ticker"><div className="tk" key={text.length}><span>{text}   ★   {text}</span></div></div>;
+}
+export function Settings({ cfg, setCfg, onClose, onForget }) {
+  const set = (k) => (e) => setCfg({ ...cfg, [k]: e.target.type === 'checkbox' ? e.target.checked : e.target.value });
+  return (
+    <div className="settings"><div className="card">
+      <h2>NEWSROOM SETTINGS</h2>
+      <div className="priv">🔒 Nothing is saved. Keys and settings live only in memory and vanish when you close the app (unless you tick “Remember”).</div>
+      <label>Groq API key (free) – console.groq.com/keys</label><input type="password" value={cfg.key} onChange={set('key')} placeholder="gsk_..." autoComplete="off" />
+      <label>Groq chat model</label><input value={cfg.model} onChange={set('model')} />
+      <label>Speech-to-text model</label><input value={cfg.stt} onChange={set('stt')} />
+      <label>News Worker URL (optional, see docs) – gives live RSS + GDELT news and hides your key</label><input value={cfg.worker} onChange={set('worker')} placeholder="https://spidey-news.yourname.workers.dev" />
+      <label>Language for voice input</label>
+      <select value={cfg.lang} onChange={set('lang')}><option value="en-IN">English (India)</option><option value="en-US">English (US)</option><option value="en-GB">English (UK)</option><option value="hi-IN">हिन्दी</option><option value="te-IN">తెలుగు</option></select>
+      <label>Anchor voice</label>
+      <select value={cfg.voice} onChange={set('voice')}><option value="">Auto (best male voice)</option>{listVoices().map((v) => <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>)}</select>
+      <label>Voice speed {cfg.rate}</label><input type="range" min="0.8" max="1.3" step="0.02" value={cfg.rate} onChange={(e) => setCfg({ ...cfg, rate: +e.target.value })} />
+      <label className="chk"><input type="checkbox" checked={cfg.remember} onChange={set('remember')} /> Remember settings on this device (off = nothing stored)</label>
+      <button className="done" onClick={onClose}>DONE</button><button className="forget" onClick={onForget}>Forget everything now</button>
+      <small>Art: Spider-Man renders supplied by you (credit the original artists; Spider-Man © Marvel). Personal/demo use only.</small>
+    </div></div>
+  );
+}
+// ---------- AI: Groq LLM + Groq Whisper (speech-to-text) + tiny RAG (BM25) ----------
+const GROQ = 'https://api.groq.com/openai/v1';
+function base(cfg) { return cfg.worker ? cfg.worker.replace(/\/$/, '') + '/groq' : GROQ; }
+function headers(cfg, json = true) { const h = {}; if (cfg.key) h.Authorization = 'Bearer ' + cfg.key; if (json) h['Content-Type'] = 'application/json'; return h; }
+async function check(r) { if (!r.ok) { let t = ''; try { t = (await r.text()).slice(0, 200); } catch (e) {} throw new Error(`Groq ${r.status}: ${t}`); } return r; }
+
+export async function chat(messages, cfg, { json = false, temperature = 0.6, max_tokens = 700 } = {}) {
+  const models = [cfg.model, 'llama-3.1-8b-instant'];     // automatic fallback model
+  let err;
+  for (const model of models) {
+    try {
+      const body = { model, messages, temperature, max_tokens };
+      if (json) body.response_format = { type: 'json_object' };
+      const r = await check(await fetch(base(cfg) + '/chat/completions', { method: 'POST', headers: headers(cfg), body: JSON.stringify(body) }));
+      return (await r.json()).choices[0].message.content.trim();
+    } catch (e) { err = e; }
+  }
+  throw err;
+}
+export async function transcribe(blob, cfg) {
+  const f = new FormData(); f.append('file', blob, 'audio.webm'); f.append('model', cfg.stt || 'whisper-large-v3-turbo'); f.append('response_format', 'json');
+  const r = await check(await fetch(base(cfg) + '/audio/transcriptions', { method: 'POST', headers: headers(cfg, false), body: f }));
+  return ((await r.json()).text || '').trim();
+}
+
+// ----- bulletin writer (LLM turns raw headlines into anchor script) -----
+const PERSONA = 'You are Spidey, the friendly neighborhood Spider-Man, anchoring a retro TV show called "Spidey News 24". Warm, upbeat, a tiny bit witty, but always accurate and neutral on news. Never invent facts: use only the provided stories.';
+export async function writeBulletin(items, cfg) {
+  const list = items.map((s, i) => `${i + 1}. ${s.title} — ${s.desc} (source: ${s.source})`).join('\n');
+  const prompt = `${list}\n\nWrite a spoken bulletin as JSON: {"intro":"1 short greeting sentence","stories":["1-2 sentence spoken script per story, same order, mention source name once in a while"],"outro":"1 short sign-off with the line 'stay webbed'"}`;
+  const txt = await chat([{ role: 'system', content: PERSONA }, { role: 'user', content: prompt }], cfg, { json: true, temperature: 0.5 });
+  const j = JSON.parse(txt);
+  if (!Array.isArray(j.stories) || j.stories.length < items.length) throw new Error('Bad bulletin JSON');
+  return j;
+}
+export function templateBulletin(items) {
+  const first = (t) => (t || '').split(/(?<=[.!?])\s/)[0];
+  return { intro: 'Good day! This is Spidey News 24, your friendly neighborhood newscast.', stories: items.map((s) => `${s.title}. ${first(s.desc) === s.title ? '' : first(s.desc)} Source: ${s.source}.`), outro: 'That is all for now. Stay webbed, stay informed!' };
+}
+
+// ----- RAG: BM25 keyword retrieval over the headlines we just fetched (in memory, nothing stored) -----
+const STOP = new Set('a an the and or of to in on for with is are was were be by at from as that this it its about what who when where why how tell me news latest today any'.split(' '));
+const tok = (s) => (s.toLowerCase().match(/[a-z0-9\u0900-\u0dff]+/g) || []).filter((w) => !STOP.has(w));
+let IDX = { docs: [], df: new Map(), avg: 1 };
+export function buildIndex(items) {
+  const docs = items.map((it) => { const t = tok(it.title + ' ' + it.title + ' ' + it.desc + ' ' + it.source); const tf = new Map(); t.forEach((w) => tf.set(w, (tf.get(w) || 0) + 1)); return { it, tf, len: t.length }; });
+  const df = new Map(); docs.forEach((d) => d.tf.forEach((_, w) => df.set(w, (df.get(w) || 0) + 1)));
+  IDX = { docs, df, avg: docs.reduce((a, d) => a + d.len, 0) / Math.max(1, docs.length) };
+}
+export function search(q, k = 5) {
+  const N = IDX.docs.length, k1 = 1.5, b = 0.75, qs = tok(q);
+  return IDX.docs.map((d) => {
+    let s = 0;
+    for (const w of qs) { const f = d.tf.get(w) || 0; if (!f) continue; const n = IDX.df.get(w); const idf = Math.log(1 + (N - n + 0.5) / (n + 0.5)); s += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * d.len / IDX.avg)); }
+    return { it: d.it, s };
+  }).filter((x) => x.s > 0).sort((a, b) => b.s - a.s).slice(0, k).map((x) => x.it);
+}
+export async function answerFromNews(q, hits, cfg) {
+  if (!hits.length) return "I don't see that in the latest headlines I have. Try another topic or refresh the news.";
+  if (!cfg.key && !cfg.worker) { const h = hits[0]; return `${h.title}. ${h.desc !== h.title ? h.desc : ''} Source: ${h.source}.`; }
+  const ctx = hits.map((s, i) => `[${i + 1}] ${s.title} — ${s.desc} (${s.source}, ${new Date(s.time).toLocaleString()})`).join('\n');
+  return chat([{ role: 'system', content: PERSONA + ' Answer ONLY from the CONTEXT. If the answer is not in the context, say you do not have it yet. Max 60 words, spoken style, no markdown, name the source.' },
+    { role: 'user', content: `CONTEXT:\n${ctx}\n\nQUESTION: ${q}` }], cfg, { temperature: 0.2, max_tokens: 250 });
+}
+
+// ----- microphone helpers -----
+export function recorder() {
+  let mr, chunks = [], stream;
+  return {
+    async start() { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); mr = new MediaRecorder(stream); chunks = []; mr.ondataavailable = (e) => chunks.push(e.data); mr.start(); },
+    stop() { return new Promise((res) => { mr.onstop = () => { stream.getTracks().forEach((t) => t.stop()); res(new Blob(chunks, { type: mr.mimeType })); chunks = []; }; mr.stop(); }); },
+  };
+}
+export function webSpeechOnce(lang) {
+  return new Promise((res, rej) => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition; if (!SR) return rej(new Error('No speech recognition in this browser'));
+    const r = new SR(); r.lang = lang; r.interimResults = false; r.onresult = (e) => res(e.results[0][0].transcript); r.onerror = (e) => rej(new Error(e.error)); r.onend = () => res(''); r.start();
+  });
+}
+// ---------- NEWS FETCHING ----------
+// 1) If you deployed worker/worker.js, we call it: it reads many RSS feeds + GDELT and returns clean JSON (cached 60 s).
+// 2) Otherwise we fall back to free sources that allow browser calls: Wikipedia "In the news" + Hacker News.
+export const TOPICS = [['world', 'WORLD'], ['india', 'INDIA'], ['tech', 'TECH'], ['business', 'BUSINESS'], ['sports', 'SPORTS'], ['science', 'SCIENCE']];
+const QS = new URLSearchParams(location.search);
+const strip = (h) => (h || '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+
+const DEMO = [
+  ['Global leaders meet to discuss climate finance as talks enter final day', 'Negotiators say a deal on funding for developing nations is within reach after overnight sessions.', 'Demo Wire'],
+  ['Tech giants unveil new AI assistants for phones and laptops', 'Companies promise faster on-device models and better privacy controls in the latest releases.', 'Demo Wire'],
+  ['India posts strong quarterly growth driven by services and manufacturing', 'Analysts expect the momentum to continue through the festive season.', 'Demo Wire'],
+  ['Scientists detect unusual signal from distant galaxy cluster', 'Astronomers will follow up with more telescopes in the coming weeks.', 'Demo Wire'],
+  ['Cricket: late wickets turn the match as teams head into the final session', 'A tense finish is expected with the new ball due in the next few overs.', 'Demo Wire'],
+  ['Markets open higher as investors weigh central bank signals', 'Banking and IT stocks led early gains while oil prices eased.', 'Demo Wire'],
+].map(([title, desc, source], i) => ({ title, desc, source, url: '#', time: Date.now() - i * 4 * 60000 }));
+
+export async function fetchNews(topic, cfg) {
+  if (QS.get('demo')) return DEMO;
+  if (cfg.worker) {
+    const r = await fetch(`${cfg.worker.replace(/\/$/, '')}/news?topic=${topic}`);
+    if (!r.ok) throw new Error('News worker error ' + r.status);
+    return (await r.json()).items;
+  }
+  const out = [];
+  try { // Wikipedia current events (free, CORS ok)
+    const d = new Date(); const p = (n) => String(n).padStart(2, '0');
+    const r = await fetch(`https://api.wikimedia.org/feed/v1/wikipedia/en/featured/${d.getUTCFullYear()}/${p(d.getUTCMonth() + 1)}/${p(d.getUTCDate())}`);
+    const j = await r.json();
+    (j.news || []).forEach((n) => out.push({ title: strip(n.story).slice(0, 160), desc: strip(n.story), source: 'Wikipedia In the News', url: n.links?.[0]?.content_urls?.desktop?.page || '#', time: Date.now() }));
+  } catch (e) { /* ignore */ }
+  try { // Hacker News top stories (tech)
+    const ids = await (await fetch('https://hacker-news.firebaseio.com/v0/topstories.json')).json();
+    const top = await Promise.all(ids.slice(0, 12).map((id) => fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`).then((r) => r.json())));
+    top.filter(Boolean).forEach((s) => out.push({ title: s.title, desc: s.title, source: 'Hacker News', url: s.url || '#', time: (s.time || 0) * 1000 }));
+  } catch (e) { /* ignore */ }
+  if (!out.length) throw new Error('No news source reachable. Deploy the worker (see docs) or check internet.');
+  return out;
+}
+// ---------- Spidey's voice: browser speech synthesis (free, offline) ----------
+let voices = [];
+const load = () => { voices = window.speechSynthesis ? speechSynthesis.getVoices() : []; };
+if ('speechSynthesis' in window) { speechSynthesis.onvoiceschanged = load; load(); }
+export const listVoices = () => voices;
+function pick(name, lang) {
+  if (name) { const v = voices.find((v) => v.name === name); if (v) return v; }
+  const same = voices.filter((v) => v.lang.toLowerCase().startsWith(lang.slice(0, 2).toLowerCase()));
+  const male = /(male|guy|ravi|david|mark|daniel|alex|james|george|rishi|aaron|fred|prabhat|madhur)/i, fem = /(female|zira|heera|neerja|samantha|susan|hazel|swara)/i;
+  return same.find((v) => male.test(v.name) && !fem.test(v.name)) || same[0] || voices[0] || null;
+}
+// speak(): returns a promise that resolves when finished; onBeat is called on every word (used for lip-sync / head bob)
+export function speak(text, { voice = '', lang = 'en-IN', rate = 1.02, pitch = 0.95, onBeat = () => {} } = {}) {
+  return new Promise((resolve) => {
+    if (!('speechSynthesis' in window)) return resolve(false);
+    speechSynthesis.cancel();
+    const parts = (text.match(/[^.!?;\n]+[.!?;]*/g) || [text]).map((s) => s.trim()).filter(Boolean); let i = 0;
+    const next = () => {
+      if (i >= parts.length) return resolve(true);
+      const u = new SpeechSynthesisUtterance(parts[i++]), v = pick(voice, lang);
+      if (v) { u.voice = v; u.lang = v.lang; } else u.lang = lang;
+      u.rate = rate; u.pitch = pitch; u.onboundary = onBeat; u.onend = next; u.onerror = next; speechSynthesis.speak(u);
+    };
+    next();
+  });
+}
+export const stopSpeaking = () => { try { speechSynthesis.cancel(); } catch (e) {} };
+// Draws the retro newspaper (canvas texture) from the live headlines.
+const cv = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+function wrap(g, text, x, y, maxW, lh, maxLines) {
+  const words = (text || '').split(/\s+/); let line = '', n = 0;
+  for (let i = 0; i < words.length; i++) {
+    const t = line ? line + ' ' + words[i] : words[i];
+    if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = words[i]; if (++n >= maxLines) { return y; } } else line = t;
+  }
+  if (line && n < maxLines) { g.fillText(line, x, y); y += lh; }
+  return y;
+}
+function halftone(g, x, y, w, h, seed) {
+  g.save(); g.beginPath(); g.rect(x, y, w, h); g.clip(); g.fillStyle = '#d9cba3'; g.fillRect(x, y, w, h); g.fillStyle = '#2a2a2a';
+  for (let j = 0; j < h; j += 7) for (let i = 0; i < w; i += 7) {
+    const v = (Math.sin((i + seed) * .05) + Math.cos((j + seed * 2) * .06) + 2) / 4; g.beginPath(); g.arc(x + i + (j / 7 % 2) * 3, y + j, 0.6 + v * 2.6, 0, 7); g.fill();
+  } g.restore(); g.strokeStyle = '#222'; g.lineWidth = 2; g.strokeRect(x, y, w, h);
+}
+export function drawPaper(items, page, dateStr) {
+  const W = 1200, H = 816, c = cv(W, H), g = c.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, W, H); grad.addColorStop(0, '#f1e6c6'); grad.addColorStop(1, '#e3d3a8'); g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  for (let i = 0; i < 1800; i++) { g.fillStyle = `rgba(90,60,20,${Math.random() * .06})`; g.fillRect(Math.random() * W, Math.random() * H, 2, 2); }
+  g.fillStyle = '#16120d'; g.textAlign = 'center'; g.font = '900 86px "Playfair Display", "Old English Text MT", Georgia, serif'; g.fillText('THE DAILY WEB', W / 2, 92);
+  g.fillRect(30, 108, W - 60, 5); g.fillRect(30, 118, W - 60, 2);
+  g.font = 'italic 700 20px "Playfair Display", Georgia, serif'; g.textAlign = 'left'; g.fillText('SPIDEY NEWS 24 EDITION · LIVE', 34, 146); g.textAlign = 'center'; g.fillText(dateStr, W / 2, 146);
+  g.textAlign = 'right'; g.fillText('PAGE ' + (page + 1) + ' · PRICE 1 WEB', W - 34, 146); g.textAlign = 'left'; g.fillRect(30, 158, W - 60, 2);
+  const a = items[page * 3] || { title: 'No news yet', desc: '', source: '' }, b = items[page * 3 + 1], d = items[page * 3 + 2];
+  g.fillStyle = '#16120d'; g.font = '900 54px "Playfair Display", Georgia, serif';
+  const y = wrap(g, (a.title || '').toUpperCase(), 34, 226, 700, 60, 4);
+  g.font = '400 22px Georgia, serif'; g.fillStyle = '#2b251c'; wrap(g, a.desc, 34, y + 12, 700, 28, 5);
+  g.font = 'italic 700 18px Georgia'; g.fillText('— ' + (a.source || ''), 34, 560);
+  halftone(g, 770, 190, 396, 300, page * 40); g.fillStyle = '#16120d'; g.font = 'italic 16px Georgia'; g.fillText('Our correspondent files from the scene.', 770, 512);
+  g.fillRect(30, 586, W - 60, 3);
+  [[b, 34], [d, 624]].forEach(([it, x]) => {
+    if (!it) return; g.fillStyle = '#16120d'; g.font = '900 30px "Playfair Display", Georgia, serif'; const yy = wrap(g, it.title, x, 632, 540, 34, 3);
+    g.font = '400 18px Georgia, serif'; g.fillStyle = '#2b251c'; wrap(g, it.desc, x, yy + 6, 540, 23, 3);
+  });
+  g.fillStyle = '#16120d'; g.fillRect(W / 2 - 1, 596, 2, 200);
+  const sh = g.createRadialGradient(W / 2, H / 2, H * .3, W / 2, H / 2, H * .85); sh.addColorStop(0, 'rgba(0,0,0,0)'); sh.addColorStop(1, 'rgba(70,40,10,.35)'); g.fillStyle = sh; g.fillRect(0, 0, W, H);
+  return c;
+}
+import * as THREE from 'three';
+import { drawPaper } from './paper.js';
+
+// ======================= helpers =======================
+const cv = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+const tex = (c, rep) => { const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; t.anisotropy = 8; if (rep) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(rep[0], rep[1]); } return t; };
+const rnd = (() => { let s = 7; return () => { s = (s * 16807) % 2147483647; return s / 2147483647; }; })();
+function woodCanvas(w, h, base, planks, vertical) {
+  const c = cv(w, h), g = c.getContext('2d'); g.fillStyle = base; g.fillRect(0, 0, w, h);
+  const n = planks, size = (vertical ? w : h) / n;
+  for (let i = 0; i < n; i++) {
+    const l = 30 + rnd() * 14; g.fillStyle = `hsl(${22 + rnd() * 6},55%,${l}%)`; vertical ? g.fillRect(i * size, 0, size - 2, h) : g.fillRect(0, i * size, w, size - 2);
+    for (let k = 0; k < 40; k++) { g.strokeStyle = `rgba(40,15,5,${rnd() * .18})`; g.beginPath(); if (vertical) { const x = i * size + rnd() * size; g.moveTo(x, 0); g.lineTo(x + rnd() * 6 - 3, h); } else { const y = i * size + rnd() * size; g.moveTo(0, y); g.lineTo(w, y + rnd() * 6 - 3); } g.stroke(); }
+  }
+  return c;
+}
+function wallCanvas() {
+  const c = cv(1024, 1024), g = c.getContext('2d'); g.fillStyle = '#0d3340'; g.fillRect(0, 0, 1024, 1024);
+  g.strokeStyle = 'rgba(255,200,120,.09)'; g.lineWidth = 2;
+  for (let i = -1024; i < 2048; i += 64) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i + 1024, 1024); g.stroke(); g.beginPath(); g.moveTo(i, 1024); g.lineTo(i + 1024, 0); g.stroke(); }
+  g.fillStyle = 'rgba(255,190,110,.1)'; for (let y = 32; y < 1024; y += 64) for (let x = 32; x < 1024; x += 64) { g.beginPath(); g.arc(x, y, 5, 0, 7); g.fill(); }
+  return c;
+}
+function chairCanvas() {
+  const c = cv(512, 640), g = c.getContext('2d'); const gr = g.createLinearGradient(0, 0, 0, 640); gr.addColorStop(0, '#2a2f3a'); gr.addColorStop(1, '#10131a'); g.fillStyle = gr; g.fillRect(0, 0, 512, 640);
+  for (let j = 0; j < 8; j++) for (let i = 0; i < 6; i++) {
+    const x = 40 + i * 86 + (j % 2) * 43, y = 50 + j * 76;
+    g.strokeStyle = 'rgba(255,255,255,.10)'; g.lineWidth = 3; g.beginPath(); g.moveTo(x, y - 38); g.lineTo(x + 43, y); g.lineTo(x, y + 38); g.lineTo(x - 43, y); g.closePath(); g.stroke();
+    const rg = g.createRadialGradient(x - 3, y - 3, 1, x, y, 10); rg.addColorStop(0, '#e8c070'); rg.addColorStop(1, '#6b4a10'); g.fillStyle = rg; g.beginPath(); g.arc(x, y, 9, 0, 7); g.fill();
+  }
+  return c;
+}
+function globeCanvas() {
+  const c = cv(512, 512), g = c.getContext('2d'); const gr = g.createRadialGradient(256, 256, 20, 256, 256, 250); gr.addColorStop(0, '#2fb0c8'); gr.addColorStop(.7, '#115f78'); gr.addColorStop(1, 'rgba(10,50,70,0)');
+  g.fillStyle = gr; g.beginPath(); g.arc(256, 256, 250, 0, 7); g.fill(); g.strokeStyle = 'rgba(255,255,255,.35)'; g.lineWidth = 2;
+  for (let r = 40; r <= 240; r += 40) { g.beginPath(); g.ellipse(256, 256, r, 240, 0, 0, 7); g.stroke(); g.beginPath(); g.ellipse(256, 256, 240, r, 0, 0, 7); g.stroke(); }
+  g.fillStyle = 'rgba(255,255,255,.25)'; for (let i = 0; i < 40; i++) { g.beginPath(); g.arc(120 + rnd() * 270, 120 + rnd() * 270, 6 + rnd() * 26, 0, 7); g.fill(); }
+  return c;
+}
+function neonCanvas(text, c1, c2) {
+  const c = cv(1024, 256), g = c.getContext('2d'); g.textAlign = 'center'; g.textBaseline = 'middle'; g.font = '110px Bangers, Impact, sans-serif';
+  g.shadowColor = c1; g.shadowBlur = 40; g.fillStyle = c1; g.fillText(text, 512, 132); g.shadowBlur = 16; g.fillStyle = '#fff'; g.fillText(text, 512, 132);
+  g.strokeStyle = c2; g.lineWidth = 6; g.shadowColor = c2; g.shadowBlur = 20; g.strokeRect(24, 28, 976, 200); return c;
+}
+function barsCanvas(label) {
+  const c = cv(256, 192), g = c.getContext('2d'); const cols = ['#fff', '#ee0', '#0ee', '#0e0', '#e0e', '#e00', '#00e']; cols.forEach((k, i) => { g.fillStyle = k; g.fillRect(i * 36.5, 0, 37, 140); });
+  g.fillStyle = '#111'; g.fillRect(0, 140, 256, 52); g.fillStyle = '#f33'; g.font = '22px VT323, monospace'; g.fillText(label, 10, 175); return c;
+}
+
+// ======================= pose plane (photo + depth map -> 3D relief) =======================
+const POSES = { e: { h: 4.5, y: 2.65 }, d: { h: 4.7, y: 2.7 }, g: { h: 4.4, y: 2.5 }, a: { h: 4.6, y: 2.6 } };
+const VERT = 'uniform sampler2D dMap;uniform float amp;varying vec2 vUv;void main(){vUv=uv;float d=texture2D(dMap,uv).r;vec3 p=position;p.z+=(d-.3)*amp;gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.);}';
+const FRAG = `uniform sampler2D map,dMap;uniform vec3 lightDir;uniform vec2 texel;uniform float alpha,flash;varying vec2 vUv;
+void main(){vec4 c=texture2D(map,vUv);float a=smoothstep(.4,.9,c.a)*alpha;if(a<.01)discard;
+ float dl=texture2D(dMap,vUv-vec2(texel.x*2.,0.)).r,dr=texture2D(dMap,vUv+vec2(texel.x*2.,0.)).r,du=texture2D(dMap,vUv+vec2(0.,texel.y*2.)).r,dd=texture2D(dMap,vUv-vec2(0.,texel.y*2.)).r;
+ vec3 n=normalize(vec3((dl-dr)*8.,(dd-du)*8.,1.));vec3 L=normalize(lightDir);float diff=max(dot(n,L),0.);float sp=pow(max(dot(reflect(-L,n),vec3(0.,0.,1.)),0.),20.);
+ vec3 col=c.rgb*(.74+.5*diff)+vec3(1.,.9,.8)*sp*.22;col*=vec3(1.05,1.0,.93);col+=vec3(1.,.3,.2)*flash*.12;gl_FragColor=vec4(col,a);}`;
+
+export function createStudio(canvas, base = './') {
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2)); renderer.outputEncoding = THREE.sRGBEncoding; renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.05;
+  const scene = new THREE.Scene(); scene.background = new THREE.Color(0x120805); scene.fog = new THREE.Fog(0x120805, 12, 30);
+  const camera = new THREE.PerspectiveCamera(30, 1, .1, 100);
+  const std = (o) => new THREE.MeshStandardMaterial({ roughness: .7, metalness: .05, ...o });
+  const box = (w, h, d, m, x, y, z, par = scene) => { const o = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m); o.position.set(x, y, z); par.add(o); return o; };
+
+  // ---- back wall: wallpaper + wood paneling ----
+  box(40, 16, .2, std({ map: tex(wallCanvas(), [10, 4]) }), 0, 6, -3.3);
+  box(40, 3.4, .3, std({ map: tex(woodCanvas(1024, 512, '#5a3216', 24, true), [8, 1]), roughness: .55 }), 0, 1.7, -3.15);
+  box(40, .18, .4, std({ color: 0xc89a4a, roughness: .35, metalness: .4 }), 0, 3.45, -3.05);
+  // ---- floor ----
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 30), std({ map: tex(woodCanvas(1024, 1024, '#4a2812', 14, false), [4, 3]), roughness: .35 })); floor.rotation.x = -Math.PI / 2; scene.add(floor);
+  const rug = new THREE.Mesh(new THREE.CircleGeometry(3.2, 48), std({ color: 0x7a1414, roughness: .95 })); rug.rotation.x = -Math.PI / 2; rug.position.set(0, .01, 1.2); rug.scale.y = .55; scene.add(rug);
+  // ---- backdrop: globe + neon + on-air + monitors ----
+  const globe = new THREE.Mesh(new THREE.PlaneGeometry(4.6, 4.6), new THREE.MeshBasicMaterial({ map: tex(globeCanvas()), transparent: true })); globe.position.set(0, 3.9, -3.0); scene.add(globe);
+  const neon = new THREE.Mesh(new THREE.PlaneGeometry(4.4, 1.1), new THREE.MeshBasicMaterial({ map: tex(neonCanvas('SPIDEY NEWS 24', '#ff2a5e', '#3ee6ff')), transparent: true })); neon.position.set(0, 5.75, -3.0); scene.add(neon);
+  const onair = new THREE.Mesh(new THREE.PlaneGeometry(1.1, .5), new THREE.MeshBasicMaterial({ map: tex(neonCanvas('ON AIR', '#ff1a1a', '#ff1a1a')), transparent: true })); onair.position.set(-4.3, 5.2, -3.0); scene.add(onair);
+  [[-4.1, 2.6, 'WORLD'], [-4.1, 3.95, 'INDIA'], [4.1, 2.6, 'TECH'], [4.1, 3.95, 'LIVE']].forEach(([x, y, l]) => {
+    const g = new THREE.Group(); g.position.set(x, y, -2.8); scene.add(g); box(1.5, 1.2, .8, std({ color: 0xcdbd98, roughness: .6 }), 0, 0, 0, g);
+    const s = new THREE.Mesh(new THREE.PlaneGeometry(1.2, .9), new THREE.MeshBasicMaterial({ map: tex(barsCanvas(l)) })); s.position.set(0, .02, .41); g.add(s);
+  });
+  // ---- chair ----
+  const chair = new THREE.Group(); chair.position.set(0, 0, -1.0); scene.add(chair);
+  const leather = std({ map: tex(chairCanvas()), roughness: .5 });
+  box(3.5, 3.9, .45, leather, 0, 2.15, 0, chair);
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(1.75, 1.75, .45, 40, 1, false, 0, Math.PI), leather); cap.rotation.set(Math.PI / 2, 0, Math.PI); cap.position.set(0, 4.1, 0); chair.add(cap);
+  box(.5, 1.2, 1.4, leather, -1.9, 1.5, .5, chair); box(.5, 1.2, 1.4, leather, 1.9, 1.5, .5, chair);
+  // ---- desk ----
+  const desk = new THREE.Group(); desk.position.set(0, 0, 1.0); scene.add(desk);
+  const wood = std({ map: tex(woodCanvas(1024, 512, '#6b3a18', 10, false)), roughness: .4, metalness: .1 });
+  box(6.4, .2, 1.9, wood, 0, 1.25, .1, desk); box(6.2, 1.2, .2, wood, 0, .62, .95, desk);
+  const plate = new THREE.Mesh(new THREE.PlaneGeometry(1.4, .5), new THREE.MeshBasicMaterial({ map: tex(neonCanvas('SN24', '#ffcf5a', '#ffcf5a')), transparent: true })); plate.position.set(0, .7, 1.06); desk.add(plate);
+  // mic
+  const mic = new THREE.Group(); mic.position.set(1.7, 1.35, .5); desk.add(mic);
+  const chrome = std({ color: 0xcfd3d8, metalness: .9, roughness: .2 });
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(.03, .03, .55, 12), chrome); stem.position.y = .28; mic.add(stem);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(.15, 20, 14), chrome); head.scale.y = 1.4; head.position.y = .64; mic.add(head);
+  box(.5, .05, .5, std({ color: 0x222222 }), 0, 0, 0, mic);
+  // mug + lamp
+  const mug = new THREE.Mesh(new THREE.CylinderGeometry(.14, .12, .22, 20), std({ color: 0xe8e0d0 })); mug.position.set(-2.3, 1.46, .5); desk.add(mug);
+  const lampBase = new THREE.Mesh(new THREE.CylinderGeometry(.18, .22, .08, 20), std({ color: 0x1b3b2a })); lampBase.position.set(-2.7, 1.39, .2); desk.add(lampBase);
+  const lampArm = new THREE.Mesh(new THREE.CylinderGeometry(.02, .02, .7, 8), chrome); lampArm.position.set(-2.7, 1.75, .2); desk.add(lampArm);
+  const shade = new THREE.Mesh(new THREE.ConeGeometry(.28, .22, 24, 1, true), std({ color: 0x1f7a52, side: THREE.DoubleSide, emissive: 0x114d33 })); shade.position.set(-2.7, 2.15, .2); desk.add(shade);
+  // paper stack
+  box(.8, .07, .55, std({ color: 0xeee6cf }), -1.6, 1.39, .75, desk).rotation.y = .2;
+
+  // ---- newspaper ----
+  const paperTex = new THREE.CanvasTexture(drawPaper([], 0, '')); paperTex.encoding = THREE.sRGBEncoding; paperTex.anisotropy = 8;
+  const pgeo = new THREE.PlaneGeometry(2.2, 1.5, 20, 1); { const p = pgeo.attributes.position; for (let i = 0; i < p.count; i++) { const x = p.getX(i) / 1.1; p.setZ(i, .16 * x * x); } pgeo.computeVertexNormals(); }
+  const paper = new THREE.Mesh(pgeo, new THREE.MeshStandardMaterial({ map: paperTex, roughness: .9, side: THREE.DoubleSide })); scene.add(paper);
+  const paperBack = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 1.5), new THREE.MeshStandardMaterial({ color: 0xcdbf98, roughness: 1 })); paperBack.position.z = -.01; paper.add(paperBack);
+
+  // ---- lights ----
+  scene.add(new THREE.HemisphereLight(0xffe2b8, 0x1a0c2a, .8));
+  const key = new THREE.DirectionalLight(0xffd7a0, 1.5); key.position.set(4, 6, 6); scene.add(key);
+  const rim = new THREE.DirectionalLight(0x4ac8ff, 1.2); rim.position.set(-5, 4, -3); scene.add(rim);
+  const lampL = new THREE.PointLight(0x7dffb0, .8, 6); lampL.position.set(-2.7, 2.1, 1.3); scene.add(lampL);
+  const glowL = new THREE.PointLight(0xff3a6a, .7, 9); glowL.position.set(0, 5, -1.5); scene.add(glowL);
+
+  // ---- Spidey pose planes ----
+  const poseGroup = new THREE.Group(); poseGroup.position.set(0, 0, -.15); scene.add(poseGroup);
+  const planes = {}; let current = 'e', ready = false;
+  const loader = new THREE.TextureLoader();
+  const L = (u) => new Promise((res, rej) => loader.load(u, res, undefined, rej));
+  const lightDir = new THREE.Vector3(.3, .5, 1);
+  Promise.all(Object.keys(POSES).map(async (k) => {
+    const [map, dm] = await Promise.all([L(`${base}poses/${k}.webp`), L(`${base}poses/${k}-d.png`)]);
+    [map, dm].forEach((t) => { t.minFilter = THREE.LinearFilter; t.generateMipmaps = false; });
+    const iw = map.image.width, ih = map.image.height, H = POSES[k].h, W = H * iw / ih;
+    const uni = { map: { value: map }, dMap: { value: dm }, amp: { value: .55 }, lightDir: { value: lightDir }, texel: { value: new THREE.Vector2(1 / dm.image.width, 1 / dm.image.height) }, alpha: { value: k === current ? 1 : 0 }, flash: { value: 0 } };
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(W, H, 100, Math.round(100 * H / W)), new THREE.ShaderMaterial({ uniforms: uni, vertexShader: VERT, fragmentShader: FRAG, transparent: true, side: THREE.DoubleSide }));
+    m.frustumCulled = false; m.position.y = POSES[k].y; poseGroup.add(m); planes[k] = { m, uni };
+  })).then(() => { ready = true; }).catch((e) => console.warn('pose load failed', e));
+
+  // ---- state & API ----
+  const S = { talk: 0, talkT: 0, reading: true, readingK: 1, flip: 0, pendingPaper: null, breaking: false, px: 0, py: 0, t: 0, onair: false };
+  let items = [], page = 0, dateStr = '';
+  const fmtDate = () => new Date().toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  const api = {
+    get ready() { return ready; },
+    setPose(k) { if (planes[k]) current = k; },
+    setTalk(v) { S.talkT = v; },
+    setReading(b) { S.reading = b; },
+    setOnAir(b) { S.onair = b; },
+    setBreaking(b) { S.breaking = b; },
+    setItems(it) { items = it; dateStr = fmtDate(); api.showPage(page, true); },
+    showPage(p, instant) { page = Math.max(0, p); S.pendingPaper = drawPaper(items, page, dateStr || fmtDate()); if (instant) { paperTex.image = S.pendingPaper; paperTex.needsUpdate = true; S.pendingPaper = null; } else S.flip = 1; },
+    get page() { return page; },
+    pointer(x, y) { S.px = x; S.py = y; },
+    resize() {
+      const w = innerWidth, h = innerHeight; renderer.setSize(w, h, false); camera.aspect = w / h; const tn = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+      const d = Math.max(5.3 / (2 * tn), 4.2 / (camera.aspect * 2 * tn)); camera.position.set(0, 3.0, d); camera.lookAt(0, 3.1, 0); camera.updateProjectionMatrix();
+    },
+    dispose() { cancelAnimationFrame(raf); renderer.dispose(); },
+  };
+  api.resize();
+  let raf, last = performance.now();
+  function loop(now) {
+    raf = requestAnimationFrame(loop); const dt = Math.min(.05, (now - last) / 1000); last = now; S.t += dt; const t = S.t;
+    S.talk += (S.talkT - S.talk) * (1 - Math.exp(-dt * 18));
+    // pose crossfade
+    Object.entries(planes).forEach(([k, p]) => { const target = k === current ? 1 : 0; p.uni.alpha.value += (target - p.uni.alpha.value) * (1 - Math.exp(-dt * 12)); p.m.visible = p.uni.alpha.value > .01; p.uni.flash.value += ((S.breaking ? 1 : 0) - p.uni.flash.value) * .1; });
+    // anchor motion: breathing, talking bob, lean forward when reading, mouse parallax
+    S.readingK += ((S.reading ? 1 : 0) - S.readingK) * (1 - Math.exp(-dt * 5));
+    poseGroup.position.y = Math.sin(t * 1.4) * .02 + S.talk * Math.abs(Math.sin(t * 9)) * .05;
+    poseGroup.rotation.x = S.readingK * .06 + S.py * .03; poseGroup.rotation.y = S.px * .18 + Math.sin(t * .5) * .03 + S.talk * Math.sin(t * 3) * .05; poseGroup.rotation.z = Math.sin(t * .7) * .01 + S.talk * Math.sin(t * 6) * .012;
+    poseGroup.scale.set(1 - S.talk * .01, 1 + S.talk * .02, 1);
+    lightDir.set(-S.px * .9 + .3, -S.py * .9 + .5, 1);
+    // newspaper: raised when reading, laid on the desk otherwise; page-flip animation
+    const k = S.readingK; paper.position.set(0, 1.38 + (2.0 - 1.38) * k, 1.4); paper.rotation.x = -1.3 * (1 - k) - .1 * k;
+    if (S.flip > 0) { S.flip -= dt * 2.2; const f = Math.max(S.flip, 0); paper.scale.x = Math.max(.02, Math.abs(Math.cos((1 - f) * Math.PI))); if (S.pendingPaper && f < .5) { paperTex.image = S.pendingPaper; paperTex.needsUpdate = true; S.pendingPaper = null; } if (f <= 0) paper.scale.x = 1; }
+    onair.material.opacity = S.onair ? .7 + .3 * Math.abs(Math.sin(t * 3)) : .25; neon.material.opacity = .9 + Math.sin(t * 7) * .04 * (Math.random() > .97 ? 4 : 1);
+    camera.position.x = S.px * .35; camera.lookAt(0, 3.1, 0);
+    renderer.render(scene, camera);
+  }
+  raf = requestAnimationFrame(loop);
+  return api;
+}
+import React, { useEffect, useRef, useState } from 'react';
+import { createStudio } from './scene/studio.js';
+import { fetchNews, TOPICS } from './lib/news.js';
+import { chat, transcribe, writeBulletin, templateBulletin, buildIndex, search, answerFromNews, recorder, webSpeechOnce } from './lib/ai.js';
+import { speak, stopSpeaking } from './lib/speech.js';
+import { Intro, LowerThird, Ticker, Settings } from './components/Overlays.jsx';
+
+const DEF = { key: '', model: 'llama-3.3-70b-versatile', stt: 'whisper-large-v3-turbo', worker: '', lang: 'en-IN', voice: '', rate: 1.02, remember: false };
+const load = () => { try { const s = localStorage.getItem('spidey.news.cfg'); return s ? { ...DEF, ...JSON.parse(s), remember: true } : DEF; } catch (e) { return DEF; } };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const POSE_CYCLE = ['e', 'g', 'e', 'd', 'e', 'a'];
+
+export default function App() {
+  const canvasRef = useRef(); const studio = useRef(); const run = useRef(0); const rec = useRef(null);
+  const [cfg, setCfg] = useState(load); const cfgR = useRef(cfg); cfgR.current = cfg;
+  const [topic, setTopic] = useState('world'); const [items, setItems] = useState([]); const itemsR = useRef([]); itemsR.current = items;
+  const seen = useRef(new Set()); const [onAir, setOnAir] = useState(false); const [lower, setLower] = useState(null);
+  const [status, setStatus] = useState('Ready'); const [stinger, setStinger] = useState(null); const [toast, setToast] = useState(''); const [showSet, setShowSet] = useState(false);
+  const [recording, setRecording] = useState(false); const [clock, setClock] = useState(new Date()); const [next, setNext] = useState(60);
+  const say = (m) => { setToast(m); setTimeout(() => setToast(''), 4500); };
+
+  // persist only if the user ticked "remember"
+  useEffect(() => { try { cfg.remember ? localStorage.setItem('spidey.news.cfg', JSON.stringify(cfg)) : localStorage.removeItem('spidey.news.cfg'); } catch (e) {} }, [cfg]);
+
+  // 3D studio
+  useEffect(() => {
+    const s = createStudio(canvasRef.current, import.meta.env.BASE_URL); studio.current = s;
+    const onR = () => s.resize(), onM = (e) => s.pointer((e.clientX / innerWidth - .5) * 2, (e.clientY / innerHeight - .5) * 2);
+    addEventListener('resize', onR); addEventListener('pointermove', onM);
+    const c = setInterval(() => setClock(new Date()), 1000);
+    return () => { removeEventListener('resize', onR); removeEventListener('pointermove', onM); clearInterval(c); s.dispose(); };
+  }, []);
+
+  // live news: refresh every 60 s, detect breaking items
+  async function refresh(t = topic, quiet = false) {
+    try {
+      const list = (await fetchNews(t, cfgR.current)).sort((a, b) => b.time - a.time).slice(0, 40);
+      const fresh = list.filter((i) => !seen.current.has(i.title)); list.forEach((i) => seen.current.add(i.title));
+      setItems(list); buildIndex(list); studio.current?.setItems(list); setNext(60);
+      if (!quiet && fresh.length && seen.current.size > list.length) { studio.current?.setBreaking(true); setTimeout(() => studio.current?.setBreaking(false), 4000); }
+      return list;
+    } catch (e) { say(e.message); return []; }
+  }
+  useEffect(() => { seen.current = new Set(); refresh(topic, true); }, [topic]);
+  useEffect(() => { const t = setInterval(() => { setNext((n) => { if (n <= 1) { refresh(topic); return 60; } return n - 1; }); }, 1000); return () => clearInterval(t); }, [topic]);
+
+  // talk helper: voice + head-bob/lip-sync
+  async function talk(text) {
+    let beat = 0; const iv = setInterval(() => studio.current?.setTalk(.35 + .5 * Math.abs(Math.sin(Date.now() / 90)) + beat), 70);
+    const ok = await speak(text, { voice: cfgR.current.voice, lang: cfgR.current.lang, rate: cfgR.current.rate, onBeat: () => { beat = .2; setTimeout(() => (beat = 0), 120); } });
+    clearInterval(iv); studio.current?.setTalk(0); return ok;
+  }
+
+  // ===== broadcast: intro -> bulletin -> stories (newspaper page flips) -> outro =====
+  async function stopAir() { run.current++; stopSpeaking(); setOnAir(false); studio.current?.setOnAir(false); setStinger(null); setLower(null); setStatus('Ready'); studio.current?.setTalk(0); }
+  async function goOnAir() {
+    if (onAir) return stopAir();
+    const id = ++run.current, alive = () => run.current === id; setOnAir(true); studio.current?.setOnAir(true);
+    let list = itemsR.current.length ? itemsR.current : await refresh(topic, true); list = list.slice(0, 6);
+    if (!list.length) { say('No news yet'); return stopAir(); }
+    setStinger('in'); setStatus('Starting broadcast'); const bulletinP = (cfgR.current.key || cfgR.current.worker ? writeBulletin(list, cfgR.current) : Promise.resolve(templateBulletin(list))).catch((e) => { say('AI script failed → using simple script. ' + e.message); return templateBulletin(list); });
+    await sleep(2600); const bul = await bulletinP; if (!alive()) return; setStinger(null);
+    studio.current?.setReading(false); studio.current?.setPose('g'); setLower({ title: 'SPIDEY NEWS 24 — LIVE', source: 'Topic: ' + topic.toUpperCase(), tag: 'WELCOME' }); setStatus('On air'); await talk(bul.intro); if (!alive()) return;
+    for (let i = 0; i < list.length; i++) {
+      if (!alive()) return; const it = list[i];
+      studio.current?.setReading(true); studio.current?.setPose(POSE_CYCLE[(i + 1) % POSE_CYCLE.length]); if (i % 3 === 0) studio.current?.showPage(Math.floor(i / 3));
+      setLower({ title: it.title, source: it.source, time: it.time, tag: 'STORY ' + (i + 1) }); await talk(bul.stories[i]); await sleep(250);
+    }
+    if (!alive()) return; studio.current?.setReading(false); studio.current?.setPose('g'); setLower(null); setStinger('out'); await talk(bul.outro); await sleep(900);
+    if (alive()) { setStinger(null); setOnAir(false); studio.current?.setOnAir(false); setStatus('Ready'); }
+  }
+
+  // ===== ask the news (voice question -> RAG over live headlines -> spoken answer) =====
+  async function ask() {
+    if (recording) { // stop and process
+      setRecording(false); setStatus('Thinking…');
+      try {
+        let q; if (rec.current?.kind === 'groq') { const blob = await rec.current.r.stop(); q = await transcribe(blob, cfgR.current); } else q = rec.current.p ? await rec.current.p : '';
+        if (!q) { setStatus('Ready'); return say("I didn't catch that"); }
+        await answer(q);
+      } catch (e) { say(e.message); setStatus('Ready'); }
+      return;
+    }
+    stopSpeaking(); run.current++; setOnAir(false); setStinger(null);
+    try {
+      if (cfgR.current.key || cfgR.current.worker) { const r = recorder(); await r.start(); rec.current = { kind: 'groq', r }; setTimeout(() => { if (rec.current?.r === r && rec.current) { /* auto-stop after 9 s */ document.getElementById('askBtn')?.click(); } }, 9000); }
+      else { rec.current = { kind: 'web', p: webSpeechOnce(cfgR.current.lang) }; rec.current.p.then(() => { if (rec.current) { setRecording(false); } }); }
+      setRecording(true); setStatus('Listening… tap ASK again to send');
+      if (rec.current.kind === 'web') { const q = await rec.current.p.catch(() => ''); setRecording(false); if (q) await answer(q); else setStatus('Ready'); }
+    } catch (e) { say(e.message); setRecording(false); setStatus('Ready'); }
+  }
+  async function answer(q) {
+    setLower({ title: 'Q: ' + q, source: 'Searching the latest news…', tag: 'YOU ASKED' }); studio.current?.setReading(true); studio.current?.setPose('e');
+    const hits = search(q, 5); let a;
+    try { a = await answerFromNews(q, hits, cfgR.current); } catch (e) { say(e.message); a = 'My web signal is weak. Check the Groq key or internet.'; }
+    setLower({ title: a, source: hits[0] ? hits[0].source : 'Spidey News 24', tag: 'ANSWER' }); setStatus('Answering'); studio.current?.setPose('g'); await talk(a); setStatus('Ready'); setTimeout(() => setLower(null), 6000);
+  }
+  const forget = () => { try { localStorage.removeItem('spidey.news.cfg'); } catch (e) {} setCfg(DEF); say('Everything forgotten'); };
+  const flipPage = () => { const s = studio.current; if (s) s.showPage((s.page + 1) % Math.max(1, Math.ceil(items.length / 3))); };
+
+  return (
+    <>
+      <canvas ref={canvasRef} className="stage" />
+      <div className="fx grade" /><div className="fx scan" /><div className="fx grain" />
+      <div className="topbar">
+        <div className={'live' + (onAir ? ' on' : '')}><i />{onAir ? 'ON AIR' : 'LIVE'}</div>
+        <div className="clock">{clock.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</div>
+        <div className="refresh">refresh in {next}s</div>
+      </div>
+      <div className="topics">{TOPICS.map(([k, l]) => <button key={k} className={'chip' + (topic === k ? ' sel' : '')} onClick={() => setTopic(k)}>{l}</button>)}</div>
+      <div className="dock left">
+        <button className={'tile red' + (onAir ? ' active' : '')} onClick={goOnAir}><svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="12" fill="#fff" /><path d="M14 20a26 26 0 0 0 0 24M50 20a26 26 0 0 1 0 24M22 24a16 16 0 0 0 0 16M42 24a16 16 0 0 1 0 16" stroke="#fff" strokeWidth="4" fill="none" strokeLinecap="round" /></svg><span className="lbl">{onAir ? 'STOP' : 'ON AIR'}</span></button>
+        <button id="askBtn" className={'tile blue' + (recording ? ' active rec' : '')} onClick={ask}><svg viewBox="0 0 48 48" fill="none" stroke="#fff" strokeWidth="3.6" strokeLinecap="round"><rect x="17" y="5" width="14" height="25" rx="7" fill="#fff" /><path d="M10 23a14 14 0 0 0 28 0M24 37v7M16 44h16" /></svg><span className="lbl">{recording ? 'SEND' : 'ASK'}</span></button>
+      </div>
+      <div className="dock right">
+        <button className="tile gold sm" onClick={() => refresh(topic)}><svg viewBox="0 0 64 64" fill="none" stroke="#fff" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round"><path d="M50 22A22 22 0 1 0 54 36" /><path d="M52 8v14H38" /></svg><span className="lbl">REFRESH</span></button>
+        <button className="tile green sm" onClick={flipPage}><svg viewBox="0 0 64 64" fill="#fff"><rect x="12" y="10" width="40" height="44" rx="4" /><path d="M20 22h24M20 32h24M20 42h14" stroke="#14532d" strokeWidth="4" strokeLinecap="round" /></svg><span className="lbl">PAPER</span></button>
+        <button className="tile gray sm" onClick={() => setShowSet(true)}><svg viewBox="0 0 48 48" fill="#fff"><path fillRule="evenodd" d="M24 12a12 12 0 1 0 0 24a12 12 0 1 0 0-24zm0 7a5 5 0 1 1 0 10a5 5 0 1 1 0-10z" /><g>{[0, 45, 90, 135].map((r) => <rect key={r} x="21" y="3" width="6" height="42" rx="3" transform={`rotate(${r} 24 24)`} />)}</g></svg><span className="lbl">SETUP</span></button>
+      </div>
+      <div className="status">{status}{cfg.key || cfg.worker ? ' · AI: GROQ' : ' · AI: LOCAL'}</div>
+      <LowerThird data={lower} /><Ticker items={items} /><Intro kind={stinger} />
+      {toast && <div className="toast">{toast}</div>}
+      {showSet && <Settings cfg={cfg} setCfg={setCfg} onClose={() => setShowSet(false)} onForget={forget} />}
+    </>
+  );
+}
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App.jsx';
+import './styles.css';
+createRoot(document.getElementById('root')).render(<App />);
+if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) navigator.serviceWorker.register('sw.js').catch(() => {});
+:root{--st:env(safe-area-inset-top,0px);--sb:env(safe-area-inset-bottom,0px)}
+*{box-sizing:border-box;-webkit-user-select:none;user-select:none}
+html,body,#root{margin:0;height:100%;overflow:hidden;background:#120805;font-family:"Fredoka","Trebuchet MS",system-ui,sans-serif;color:#fff;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+.stage{position:fixed;inset:0;width:100%;height:100%;display:block}
+.fx{position:fixed;inset:0;pointer-events:none;z-index:2}
+.grade{background:radial-gradient(ellipse at 50% 45%,rgba(0,0,0,0) 50%,rgba(20,6,0,.7) 100%),linear-gradient(180deg,rgba(255,140,60,.10),rgba(0,60,90,.14));mix-blend-mode:normal}
+.scan{background:repeating-linear-gradient(0deg,rgba(0,0,0,.16) 0 1px,transparent 1px 3px);opacity:.5}
+.grain{opacity:.16;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='160' height='160' filter='url(%23n)'/></svg>");animation:gr .6s steps(4) infinite}
+@keyframes gr{0%{background-position:0 0}25%{background-position:-40px 30px}50%{background-position:30px -50px}75%{background-position:-60px -20px}100%{background-position:0 0}}
+.topbar{position:fixed;top:calc(10px + var(--st));left:12px;right:12px;z-index:6;display:flex;align-items:center;justify-content:space-between;pointer-events:none}
+.live{display:flex;align-items:center;gap:8px;padding:6px 14px;border-radius:6px;background:#3a0a0a;border:3px solid #fff;font-family:"Bangers",Impact,sans-serif;font-size:22px;letter-spacing:2px}
+.live i{width:12px;height:12px;border-radius:50%;background:#777}.live.on{background:#c40000}.live.on i{background:#fff;animation:bl 1s infinite}
+@keyframes bl{50%{opacity:.2}}
+.clock{font-family:"VT323",monospace;font-size:30px;background:rgba(0,0,0,.6);padding:0 12px;border:2px solid #ffcf5a;color:#ffcf5a;border-radius:4px}
+.refresh{font-size:12px;opacity:.8;background:rgba(0,0,0,.5);padding:3px 10px;border-radius:99px}
+.topics{position:fixed;top:calc(58px + var(--st));left:0;right:0;z-index:6;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;padding:0 8px}
+.chip{border:2px solid #ffcf5a;background:rgba(30,12,4,.75);color:#ffcf5a;font:700 13px "Fredoka",sans-serif;letter-spacing:1px;padding:5px 12px;border-radius:99px;cursor:pointer}
+.chip.sel{background:#ffcf5a;color:#2a1204}
+.status{position:fixed;bottom:calc(46px + var(--sb));left:50%;transform:translateX(-50%);z-index:6;font-size:12px;background:rgba(0,0,0,.55);border:2px solid rgba(255,255,255,.5);padding:3px 14px;border-radius:99px;white-space:nowrap}
+/* tiles */
+.dock{position:fixed;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:28px;z-index:6}.dock.left{left:12px}.dock.right{right:12px}
+.tile{--c1:#4aa8ff;--c2:#1b4fd8;--glow:rgba(120,190,255,.95);position:relative;width:74px;height:74px;border-radius:24px;border:4px solid #fff;cursor:pointer;padding:0;display:grid;place-items:center;color:#fff;
+ background:radial-gradient(ellipse at 50% -10%,rgba(255,255,255,.75),rgba(255,255,255,0) 55%),linear-gradient(165deg,var(--c1),var(--c2));
+ box-shadow:0 7px 0 rgba(0,0,0,.4),0 14px 24px rgba(0,0,0,.45),inset 0 -9px 14px rgba(0,0,0,.3),inset 0 3px 0 rgba(255,255,255,.5);transition:transform .12s}
+.tile svg{width:44px;height:44px;filter:drop-shadow(0 3px 2px rgba(0,0,0,.45))}.tile:active{transform:translateY(6px) scale(.96)}
+.tile .lbl{position:absolute;left:50%;top:100%;margin-top:8px;transform:translateX(-50%);font-size:12px;letter-spacing:.8px;font-weight:700;text-shadow:0 2px 0 #000,0 0 8px #000;white-space:nowrap;pointer-events:none}
+.tile.sm{width:60px;height:60px;border-radius:20px}.tile.sm svg{width:36px;height:36px}
+.tile.red{--c1:#ff6a5a;--c2:#c40000;--glow:rgba(255,80,60,.9)}.tile.blue{--c1:#5de6ff;--c2:#0a64c8}.tile.gold{--c1:#ffe36a;--c2:#e08a00}.tile.green{--c1:#6aff9a;--c2:#0f8a44}.tile.gray{--c1:#9fb4d8;--c2:#4a5f8c}
+.tile.active{animation:pl 1.4s ease-in-out infinite;box-shadow:0 0 0 6px var(--glow),0 0 34px 12px var(--glow),0 7px 0 rgba(0,0,0,.4)}
+.tile.rec{--c1:#ff4d4d;--c2:#a30000}@keyframes pl{50%{box-shadow:0 0 0 10px var(--glow),0 0 50px 18px var(--glow),0 7px 0 rgba(0,0,0,.4)}}
+/* lower third + ticker */
+.lower{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(76px + var(--sb));width:min(760px,calc(100vw - 190px));z-index:6;background:linear-gradient(90deg,#14243f,#0b1428);border:3px solid #fff;border-left:14px solid #ffcf5a;padding:8px 16px 8px 16px;box-shadow:0 10px 30px rgba(0,0,0,.6);animation:li .4s ease-out}
+.lower.brk{border-left-color:#ff2a2a;background:linear-gradient(90deg,#4a0a0a,#2a0606)}
+@keyframes li{from{transform:translateX(-50%) translateY(40px);opacity:0}}
+.lower .tag{position:absolute;top:-16px;left:-6px;background:#ffcf5a;color:#2a1204;font:900 13px "Playfair Display",serif;letter-spacing:2px;padding:2px 10px}.lower.brk .tag{background:#ff2a2a;color:#fff}
+.lower .head{font:700 clamp(15px,2.2vw,22px)/1.25 "Playfair Display",Georgia,serif;max-height:4.6em;overflow:hidden}.lower .meta{font-size:12px;opacity:.75;margin-top:2px}
+.ticker{position:fixed;left:0;right:0;bottom:var(--sb);height:38px;z-index:6;background:#0b1428;border-top:3px solid #ffcf5a;overflow:hidden;display:flex;align-items:center}
+.ticker .tk{white-space:nowrap;animation:tk 90s linear infinite;font:400 24px "VT323",monospace;color:#ffe9a8;letter-spacing:1px}
+@keyframes tk{from{transform:translateX(100vw)}to{transform:translateX(-100%)}}
+.toast{position:fixed;left:50%;top:calc(100px + var(--st));transform:translateX(-50%);z-index:9;background:#c4111f;border:3px solid #fff;padding:8px 16px;border-radius:14px;font-weight:700;max-width:86vw;text-align:center}
+/* stingers */
+.stinger{position:fixed;inset:0;z-index:8;background-size:cover;background-position:center;display:grid;place-items:center;overflow:hidden;animation:sfade .3s}
+.stinger img{position:absolute;height:78vh;max-width:90vw;object-fit:contain;filter:drop-shadow(0 20px 30px rgba(0,0,0,.6))}
+.stinger .swing{left:50%;top:-8vh;transform-origin:50% -10vh;animation:swing 2.4s ease-out forwards}
+@keyframes swing{0%{transform:translateX(-50%) rotate(-55deg)}50%{transform:translateX(-50%) rotate(28deg)}75%{transform:translateX(-50%) rotate(-10deg)}100%{transform:translateX(-50%) rotate(0)}}
+.stinger .drop{left:50%;top:-80vh;height:80vh;transform:translateX(-50%);animation:drop 1s cubic-bezier(.2,1.4,.4,1) forwards}
+@keyframes drop{to{top:-10vh}}
+.stTitle{position:relative;z-index:2;font-family:"Bangers",Impact,sans-serif;font-size:clamp(50px,11vw,130px);line-height:.95;text-align:center;letter-spacing:4px;color:#fff;text-shadow:6px 6px 0 #14102b,0 0 30px rgba(0,0,0,.8);transform:rotate(-4deg);animation:pop .5s .3s both}
+.stTitle.small{font-size:clamp(36px,8vw,90px);margin-top:50vh}
+.stSub{position:absolute;bottom:12vh;z-index:2;font:700 clamp(12px,2vw,22px) "Fredoka";letter-spacing:4px;background:#14102b;padding:6px 16px;border:3px solid #fff}
+@keyframes pop{from{transform:rotate(-4deg) scale(0)}}@keyframes sfade{from{opacity:0}}
+/* settings */
+.settings{position:fixed;inset:0;z-index:20;display:grid;place-items:center;background:rgba(10,4,0,.78);backdrop-filter:blur(6px)}
+.settings .card{width:min(480px,94vw);max-height:92vh;overflow:auto;padding:20px 22px;border-radius:22px;background:linear-gradient(160deg,#4a2410,#1e0e06);border:4px solid #ffcf5a}
+.settings h2{margin:0 0 6px;font-family:"Bangers",Impact,sans-serif;letter-spacing:2px;font-size:32px;color:#ffcf5a}
+.settings label{display:block;margin:12px 0 4px;font-size:13px;font-weight:700}.settings small{opacity:.7;display:block;margin-top:10px}
+.settings input[type=text],.settings input[type=password],.settings input:not([type]),.settings select{width:100%;padding:10px 12px;border-radius:12px;border:2px solid rgba(255,255,255,.4);background:rgba(0,0,0,.4);color:#fff;font:600 15px "Fredoka",sans-serif;-webkit-user-select:text;user-select:text}
+.settings input[type=range]{width:100%}.settings .chk{display:flex;gap:10px;align-items:center}
+.settings .priv{margin:8px 0;padding:8px 12px;border-radius:12px;background:rgba(80,255,160,.12);border:2px solid rgba(80,255,160,.5);font-size:12.5px}
+.settings .done,.settings .forget{margin-top:14px;width:100%;padding:12px;border-radius:14px;border:3px solid #fff;color:#fff;font:700 18px "Fredoka",sans-serif;cursor:pointer}
+.settings .done{background:linear-gradient(160deg,#ffbe4d,#e8260f)}.settings .forget{background:rgba(255,255,255,.1);font-size:14px;margin-top:8px}
+@media (max-width:700px){.tile{width:58px;height:58px;border-radius:19px}.tile svg{width:34px;height:34px}.tile.sm{width:50px;height:50px}.tile.sm svg{width:30px;height:30px}.dock{gap:34px}.lower{width:calc(100vw - 20px);bottom:calc(84px + var(--sb))}.clock{font-size:22px}.live{font-size:17px}.refresh{display:none}.topics{top:calc(54px + var(--st))}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#1b0d08">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link href="https://fonts.googleapis.com/css2?family=Bangers&family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=Fredoka:wght@500;700&family=VT323&display=swap" rel="stylesheet">
+<title>Spidey News 24</title>
+</head>
+<body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body>
+</html>
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+// base './' lets you drop the built "dist" folder on ANY static host (Netlify, GitHub Pages, Cloudflare Pages)
+export default defineConfig({ plugins: [react()], base: './' });
+name = "spidey-news"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+# Spidey News 24 – retro Spider-Man newsreader (React + Flutter)
+
+Full explanation of every file, the AI (Groq LLM, Whisper, RAG), values and Flutter code is in the DOCUMENTATION Google-style doc shared in the chat.
+
+## Fastest way (5 minutes, no coding)
+1. Go to **app.netlify.com/drop** and drag the folder **READY-TO-DEPLOY-dist** onto the page. You get an https link. Open it on PC or phone.
+2. Tap SETUP → paste your free Groq key (console.groq.com/keys) → DONE.
+3. Tap **ON AIR** (Spidey reads the news) or **ASK** (ask by voice about the news).
+Try `?demo=1` at the end of the link to see sample news without any internet feed.
+
+## Edit / run the React code on your PC
+Install Node.js (nodejs.org). In `react-app` run:  `npm install`  then  `npm run dev`  (opens http://localhost:5173).  Build for hosting: `npm run build` → creates `dist`.
+
+## Live news every minute (recommended, free)
+Deploy `worker/worker.js` on Cloudflare Workers (free): it merges BBC/Hindu/NDTV/Google News RSS + GDELT, caches 60 s, and hides your Groq key. Paste its URL into SETUP → "News Worker URL".
+
+## Flutter
+See `flutter_app/README.md` (code is written but not compiled by me – send me any error).
+{
+  "name": "spidey-news",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {}
+}
